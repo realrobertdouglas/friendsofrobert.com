@@ -1,0 +1,183 @@
+name: Watchdog
+
+# Runs every day. Reads `heartbeat` and `switch.conf`:
+#   days >= WARN_DAYS    -> opens (or bumps) a warning issue, which emails the owner
+#   days >= RELEASE_DAYS -> copies contents/ into the public site repo and pushes
+# Every run commits .watchdog/last-run so GitHub never disables the schedule
+# for inactivity (it does that after 60 quiet days on a repo).
+
+on:
+  schedule:
+    - cron: "17 13 * * *"   # 13:17 UTC daily (odd minute avoids the top-of-hour queue)
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: "TEST: publish contents/ now regardless of the heartbeat"
+        type: boolean
+        default: false
+      notify_friends:
+        description: "TEST: also email the real friends list (otherwise the letter goes to you only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency: switch
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read state
+        id: state
+        env:
+          ALIVE_URL: ${{ vars.ALIVE_URL }}
+          ALIVE_STATUS_KEY: ${{ secrets.ALIVE_STATUS_KEY }}
+        run: |
+          . ./switch.conf
+          # Source of truth is the email-link Worker. Fall back to the heartbeat
+          # file (GitHub check-ins) only if the Worker cannot be reached.
+          src="worker"
+          if [ -n "$ALIVE_URL" ] && [ -n "$ALIVE_STATUS_KEY" ] && \
+             st=$(curl -fsS -m 20 -H "X-Status-Key: $ALIVE_STATUS_KEY" "$ALIVE_URL/status"); then
+            hb=$(echo "$st" | jq -r .last_checkin_date)
+            days=$(echo "$st" | jq -r .days_since_checkin)
+          else
+            src="heartbeat-file (worker unreachable)"
+            hb=$(cat heartbeat | tr -d '[:space:]')
+            now=$(date -u +%s)
+            hb_epoch=$(date -u -d "$hb" +%s)
+            days=$(( (now - hb_epoch) / 86400 ))
+          fi
+          echo "source=$src" >> "$GITHUB_OUTPUT"
+          echo "STATE: last check-in $hb, $days days ago, via $src"
+          released=false; [ -f RELEASED ] && released=true
+          echo "days=$days"                 >> "$GITHUB_OUTPUT"
+          echo "armed=$ARMED"               >> "$GITHUB_OUTPUT"
+          echo "warn_days=$WARN_DAYS"       >> "$GITHUB_OUTPUT"
+          echo "release_days=$RELEASE_DAYS" >> "$GITHUB_OUTPUT"
+          echo "site_repo=$SITE_REPO"       >> "$GITHUB_OUTPUT"
+          echo "owner=$OWNER"               >> "$GITHUB_OUTPUT"
+          echo "released=$released"         >> "$GITHUB_OUTPUT"
+          {
+            echo "### Watchdog $(date -u +%Y-%m-%dT%H:%MZ)"
+            echo "- Last check-in: **$hb** ($days days ago) via $src"
+            echo "- Armed: **$ARMED**, warn at $WARN_DAYS, release at $RELEASE_DAYS"
+            echo "- Already released: **$released**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep schedule alive
+        run: |
+          mkdir -p .watchdog
+          date -u +%Y-%m-%dT%H:%M:%SZ > .watchdog/last-run
+          git config user.name  "dead-mans-switch"
+          git config user.email "actions@users.noreply.github.com"
+          git add .watchdog/last-run
+          git commit -qm "watchdog: ${{ steps.state.outputs.days }} days since check-in" && git push
+
+      - name: Warn
+        if: >-
+          steps.state.outputs.armed == 'true' &&
+          steps.state.outputs.released == 'false' &&
+          fromJSON(steps.state.outputs.days) >= fromJSON(steps.state.outputs.warn_days) &&
+          fromJSON(steps.state.outputs.days) <  fromJSON(steps.state.outputs.release_days)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DAYS: ${{ steps.state.outputs.days }}
+          RELEASE_DAYS: ${{ steps.state.outputs.release_days }}
+          OWNER: ${{ steps.state.outputs.owner }}
+        run: |
+          left=$(( RELEASE_DAYS - DAYS ))
+          title="⚠️ Check-in overdue: $DAYS days, release in $left"
+          body=$(printf '%s\n\n%s\n%s\n' \
+            "@$OWNER you last checked in **$DAYS days ago**. The contents will be published to the public site in **$left day(s)** unless you check in." \
+            "**To reset the clock:** Actions → \"Check in (I'm alive)\" → Run workflow, or run \`gh workflow run checkin.yml -R ${{ github.repository }}\`." \
+            "**To pause the switch:** set \`ARMED=false\` in \`switch.conf\` and push.")
+          existing=$(gh issue list --label warning --state open --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --title "$title" --body "$body"
+            gh issue comment "$existing" --body "@$OWNER still no check-in. $left day(s) left."
+          else
+            gh issue create --label warning --title "$title" --body "$body"
+          fi
+          echo "- Warning issue posted" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Decide on release
+        id: decide
+        env:
+          FORCE: ${{ inputs.force_release }}
+        run: |
+          go=false
+          if [ "$FORCE" = "true" ]; then go=true; fi
+          if [ "${{ steps.state.outputs.armed }}" = "true" ] && \
+             [ "${{ steps.state.outputs.released }}" = "false" ] && \
+             [ "${{ steps.state.outputs.days }}" -ge "${{ steps.state.outputs.release_days }}" ]; then go=true; fi
+          echo "go=$go" >> "$GITHUB_OUTPUT"
+          echo "- Release now: **$go** (force=$FORCE)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Release contents to the public site
+        if: steps.decide.outputs.go == 'true'
+        env:
+          SITE_DEPLOY_KEY: ${{ secrets.SITE_DEPLOY_KEY }}
+          SITE_REPO: ${{ steps.state.outputs.site_repo }}
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ steps.state.outputs.owner }}
+          FORCE: ${{ inputs.force_release }}
+        run: |
+          set -e
+          if [ -z "$SITE_DEPLOY_KEY" ]; then echo "SITE_DEPLOY_KEY secret is missing"; exit 1; fi
+          if [ -z "$(ls -A contents)" ]; then echo "contents/ is empty, refusing to release nothing"; exit 1; fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SITE_DEPLOY_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git clone -q "git@github.com:$SITE_REPO.git" /tmp/site
+          cp -R contents/. /tmp/site/
+          cd /tmp/site
+          git config user.name  "dead-mans-switch"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -qm "Release contents ($( [ "$FORCE" = "true" ] && echo TEST || echo switch triggered )) $(date -u +%Y-%m-%d)"
+          git push
+          cd "$GITHUB_WORKSPACE"
+          date -u +%Y-%m-%dT%H:%M:%SZ > RELEASED
+          git add RELEASED
+          git commit -qm "RELEASED $( [ "$FORCE" = "true" ] && echo '(test)' )"
+          git push
+          for n in $(gh issue list --label warning --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Contents released. Switch is now spent."
+          done
+          gh issue create --label released --title "🔓 Contents released $(date -u +%Y-%m-%d)" \
+            --body "@$OWNER contents/ was pushed to https://github.com/$SITE_REPO and is live on the site. Force/test run: $FORCE. To re-arm after a test, see README."
+          echo "- **RELEASED** to $SITE_REPO" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify friends
+        if: steps.decide.outputs.go == 'true'
+        env:
+          ALIVE_URL: ${{ vars.ALIVE_URL }}
+          ALIVE_STATUS_KEY: ${{ secrets.ALIVE_STATUS_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force_release }}
+          NOTIFY_REAL: ${{ inputs.notify_friends }}
+        run: |
+          # A forced (test) release emails the letter to the owner only, unless notify_friends was ticked.
+          test=false
+          if [ "$FORCE" = "true" ] && [ "$NOTIFY_REAL" != "true" ]; then test=true; fi
+          payload=$(jq -n --rawfile subject notify/subject.txt --rawfile text notify/message.txt --argjson test "$test" \
+            '{subject: ($subject | rtrimstr("\n")), text: $text, test: $test}')
+          if out=$(curl -fsS -m 60 -X POST -H "X-Status-Key: $ALIVE_STATUS_KEY" -H "content-type: application/json" -d "$payload" "$ALIVE_URL/notify"); then
+            echo "$out"
+            msg="Friend notifications (test=$test): $(echo "$out" | jq -r '"sent \(.sent), failed \(.failed)"')"
+            detail=$(echo "$out" | jq -r '.results[] | "- \(.to): \(if .ok then "sent" else "FAILED: " + .error end)"')
+          else
+            msg="Friend notifications FAILED: could not reach the Worker."
+            detail=""
+          fi
+          echo "- $msg" >> "$GITHUB_STEP_SUMMARY"
+          n=$(gh issue list --label released --state open --json number --jq '.[0].number')
+          [ -n "$n" ] && gh issue comment "$n" --body "$msg
+
+          $detail"

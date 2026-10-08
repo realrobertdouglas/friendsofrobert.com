@@ -1,0 +1,32 @@
+name = "yourdomain-alive"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+# Served at alive.yourdomain.com (Cloudflare creates the DNS record).
+routes = [{ pattern = "alive.yourdomain.com", custom_domain = true }]
+
+[triggers]
+crons = ["23 14 * * *"]   # daily 14:23 UTC: decide whether to send a reminder
+
+[[kv_namespaces]]
+binding = "STATE"
+id = "YOUR_KV_NAMESPACE_ID"
+
+# Sends only to addresses verified under Email Routing -> Destination addresses.
+[[send_email]]
+name = "EMAIL"
+
+[vars]
+OWNER_EMAIL       = "you@example.com"
+CF_ACCOUNT_ID     = "YOUR_CLOUDFLARE_ACCOUNT_ID"
+PUBLIC_SITE       = "https://yourdomain.com"
+FROM_EMAIL        = "alive@yourdomain.com"
+FROM_NAME         = "Your Name"
+SITE_URL          = "https://alive.yourdomain.com"
+TIMEZONE          = "America/Chicago"
+REMIND_AFTER_DAYS = "45"   # first email this many days after the last confirmation
+REMIND_EVERY_DAYS = "7"    # then again every N days until release
+RELEASE_DAYS      = "90"   # GitHub watchdog publishes at this many days
+# Secrets (wrangler secret put): TOKEN_SECRET, STATUS_KEY, ADMIN_KEY,
+#   CF_API_TOKEN (Account > Email Routing Addresses > Edit; used to register friends)

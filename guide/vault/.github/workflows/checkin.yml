@@ -1,0 +1,54 @@
+name: "Check in (I'm alive)"
+
+# Run this to reset the clock. From the GitHub app or website: Actions ->
+# "Check in (I'm alive)" -> Run workflow. From a terminal:
+#   gh workflow run checkin.yml -R YOUR-USER/YOUR-VAULT-REPO
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency: switch
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update heartbeat
+        run: |
+          date -u +%Y-%m-%d > heartbeat
+          git config user.name  "dead-mans-switch"
+          git config user.email "actions@users.noreply.github.com"
+          git add heartbeat
+          git commit -m "Check-in $(cat heartbeat) by ${{ github.actor }}" || echo "already checked in today"
+          git push
+
+      - name: Tell the email-link Worker
+        env:
+          ALIVE_URL: ${{ vars.ALIVE_URL }}
+          ALIVE_STATUS_KEY: ${{ secrets.ALIVE_STATUS_KEY }}
+        run: |
+          if [ -n "$ALIVE_URL" ] && [ -n "$ALIVE_STATUS_KEY" ]; then
+            curl -fsS -m 20 -X POST -H "X-Status-Key: $ALIVE_STATUS_KEY" "$ALIVE_URL/checkin" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Worker not configured; heartbeat file only." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Close any open warning
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for n in $(gh issue list --label warning --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Check-in received $(cat heartbeat) from ${{ github.actor }}. Clock reset."
+          done
+
+      - name: Summary
+        run: |
+          echo "### Checked in on $(cat heartbeat) UTC" >> "$GITHUB_STEP_SUMMARY"
+          . ./switch.conf
+          echo "Next warning after $WARN_DAYS days, release after $RELEASE_DAYS days." >> "$GITHUB_STEP_SUMMARY"
